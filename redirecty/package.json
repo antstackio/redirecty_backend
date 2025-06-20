@@ -1,0 +1,23 @@
+{
+  "name": "redirecty",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy --minify",
+    "test": "node test.js",
+    "query-analytics": "node test.js query-analytics",
+    "list-datasets": "node test.js list-datasets",
+    "list-urls": "node test.js list-urls",
+    "test-analytics": "node test.js test-analytics"
+  },
+  "dependencies": {
+    "@hono/zod-validator": "^0.1.11",
+    "@neondatabase/serverless": "^1.0.0",
+    "hono": "^4.7.5",
+    "nanoid": "^5.0.6",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250214.0",
+    "wrangler": "^4.4.0"
+  }
+}
