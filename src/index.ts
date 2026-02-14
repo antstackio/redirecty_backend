@@ -1,6 +1,8 @@
 import { Hono } from 'hono'
 import { neon } from '@neondatabase/serverless'
-import { nanoid } from 'nanoid'
+import { customAlphabet } from 'nanoid'
+
+const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789')
 import { z } from 'zod'
 import { zValidator } from '@hono/zod-validator'
 import { cors } from 'hono/cors'
@@ -16,7 +18,7 @@ const app = new Hono<{ Bindings: Env }>()
 
 // Add CORS middleware
 app.use('/*', cors({
-  origin: ['http://localhost:5173'], // Add your frontend URL here
+  origin: ['http://localhost:5173', 'https://antt.me', 'https://www.antt.me', 'https://dash.antt.me'],
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   exposeHeaders: ['Content-Length', 'X-Kuma-Revision'],
@@ -36,6 +38,9 @@ app.onError((err, c) => {
 // Helper function to fetch title from URL
 async function fetchTitle(url: string): Promise<string | null> {
   try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+
     const response = await fetch(url, {
       headers: { 'User-Agent': 'RedirectyTitleFetcher/1.0' }
     });
@@ -43,7 +48,9 @@ async function fetchTitle(url: string): Promise<string | null> {
       console.warn(`Failed to fetch title for ${url}: Non-HTML or bad response status ${response.status}`);
       return null;
     }
-    const html = await response.text();
+    const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
+    if (contentLength > 1024 * 1024) return null;
+    const html = (await response.text()).slice(0, 50000);
     const titleMatch = html.match(/<title>(.*?)<\/title>/i);
     return titleMatch ? titleMatch[1].trim() : null;
   } catch (error) {
@@ -55,16 +62,13 @@ async function fetchTitle(url: string): Promise<string | null> {
 // Define the schema for URL creation
 const urlSchema = z.object({
   url: z.string().url(),
-  shortCode: z.string().min(1).max(50).optional(),
+  shortCode: z.string().min(1).max(50).regex(/^[a-zA-Z0-9_-]+$/, 'Short code can only contain letters, numbers, hyphens, and underscores').optional(),
   title: z.string().max(255).optional() // Added optional title
 })
 
 // Create a short URL
 app.post('/api/create', zValidator('json', urlSchema), async (c) => {
   try {
-    // Log the DB URL being used
-    console.log('[DEBUG] Using DATABASE_URL:', c.env.DATABASE_URL);
-    
     const { url, shortCode, title: providedTitle } = c.req.valid('json')
     const sql = neon(c.env.DATABASE_URL)
 
@@ -157,6 +161,9 @@ app.post('/api/create', zValidator('json', urlSchema), async (c) => {
 app.get('/:code', async (c) => {
   try {
     const code = c.req.param('code')
+    if (!code || code.includes('.') || ['favicon', 'robots', 'sitemap', 'manifest', '.well-known'].some(f => code.startsWith(f))) {
+      return c.json({ error: 'Not found' }, 404)
+    }
     const sql = neon(c.env.DATABASE_URL)
 
     // Fetch the URL - Explicitly use public schema
@@ -182,17 +189,17 @@ app.get('/:code', async (c) => {
             referrer = 'invalid_referrer'; // Or keep as 'direct'
         }
     }
-    // AWAIT the database update to ensure completion before redirecting
-    try {
-      await sql`UPDATE public.urls 
-               SET 
-                 visit_count = visit_count + 1, 
+    // Update analytics in the background so the redirect is not delayed
+    c.executionCtx.waitUntil(
+      sql`UPDATE public.urls
+               SET
+                 visit_count = visit_count + 1,
                  last_visited_at = NOW(),
                  -- Update region visits
                  region_visits = jsonb_set(
-                   region_visits, 
-                   ARRAY[${country}::text], 
-                   (COALESCE(region_visits->>${country}::text, '0')::int + 1)::text::jsonb, 
+                   region_visits,
+                   ARRAY[${country}::text],
+                   (COALESCE(region_visits->>${country}::text, '0')::int + 1)::text::jsonb,
                    true
                  ),
                  -- Update referrer visits
@@ -202,13 +209,12 @@ app.get('/:code', async (c) => {
                    (COALESCE(referrer_visits->>${referrer}::text, '0')::int + 1)::text::jsonb,
                    true
                  )
-               WHERE short_code = ${code}`;
-      console.log(`Successfully updated analytics for ${code} from ${country} / ${referrer}`);
-    } catch (updateError) {
-        console.error(`Failed to update analytics for ${code}:`, updateError);
-    }
+               WHERE short_code = ${code}`
+        .then(() => console.log(`Successfully updated analytics for ${code} from ${country} / ${referrer}`))
+        .catch((updateError: unknown) => console.error(`Failed to update analytics for ${code}:`, updateError))
+    );
 
-    // Redirect to the original URL
+    // Redirect to the original URL immediately
     return c.redirect(full_url)
 
   } catch (err) {
@@ -225,14 +231,51 @@ app.get('/api/urls', async (c) => {
   try {
     const sql = neon(c.env.DATABASE_URL)
 
-    // Fetch URLs, visit counts, and titles
-    const results = await sql`SELECT short_code, full_url, visit_count, title FROM public.urls ORDER BY short_code ASC`
+    // Parse pagination and search query params
+    const page = Math.max(1, parseInt(c.req.query('page') || '1', 10) || 1)
+    const pageSize = Math.min(100, Math.max(1, parseInt(c.req.query('pageSize') || '50', 10) || 50))
+    const offset = (page - 1) * pageSize
+    const search = (c.req.query('search') || '').trim()
+    const escapedSearch = search.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')
+    const searchPattern = search ? `%${escapedSearch}%` : null
+    const sort = c.req.query('sort') || 'newest'
+
+    // Get total count (with optional search filter)
+    const countResult = searchPattern
+      ? await sql`SELECT COUNT(*) as count FROM public.urls WHERE title ILIKE ${searchPattern} OR full_url ILIKE ${searchPattern}`
+      : await sql`SELECT COUNT(*) as count FROM public.urls`
+    const total = parseInt(countResult[0]?.count as string, 10) || 0
+
+    // Build query with sort — must use separate tagged templates since column/direction can't be parameterized
+    const queryBase = searchPattern
+      ? (orderSql: ReturnType<typeof sql>) => sql`SELECT short_code, full_url, visit_count, title, created_at FROM public.urls WHERE title ILIKE ${searchPattern} OR full_url ILIKE ${searchPattern} ORDER BY ${orderSql} LIMIT ${pageSize} OFFSET ${offset}`
+      : (orderSql: ReturnType<typeof sql>) => sql`SELECT short_code, full_url, visit_count, title, created_at FROM public.urls ORDER BY ${orderSql} LIMIT ${pageSize} OFFSET ${offset}`
+
+    // Map sort values to SQL fragments — whitelist approach to prevent injection
+    let orderSql: ReturnType<typeof sql>
+    switch (sort) {
+      case 'oldest':
+        orderSql = sql`created_at ASC`; break
+      case 'most-visits':
+        orderSql = sql`visit_count DESC`; break
+      case 'least-visits':
+        orderSql = sql`visit_count ASC`; break
+      case 'title-az':
+        orderSql = sql`title ASC NULLS LAST`; break
+      case 'title-za':
+        orderSql = sql`title DESC NULLS LAST`; break
+      default: // 'newest'
+        orderSql = sql`created_at DESC`; break
+    }
+
+    const results = await queryBase(orderSql)
 
     // Define the type for the value in the record, including title
     type UrlData = {
       full_url: string;
       visit_count: number;
-      title: string | null; // Added title
+      title: string | null;
+      created_at: string | null;
     };
 
     // Transform the results into the desired format
@@ -241,13 +284,14 @@ app.get('/api/urls', async (c) => {
       // Cast each row when processing
       for (const row of results) {
         // Include title in the type cast
-        const typedRow = row as { short_code: string, full_url: string, visit_count: number | null, title: string | null }
+        const typedRow = row as { short_code: string, full_url: string, visit_count: number | null, title: string | null, created_at: string | null }
         // Ensure properties exist before assignment
         if (typedRow.short_code && typedRow.full_url) {
             urls[typedRow.short_code] = {
               full_url: typedRow.full_url,
-              visit_count: typedRow.visit_count || 0, // Default to 0 if null
-              title: typedRow.title // Add title here
+              visit_count: typedRow.visit_count || 0,
+              title: typedRow.title,
+              created_at: typedRow.created_at
             };
         }
       }
@@ -255,7 +299,10 @@ app.get('/api/urls', async (c) => {
 
     return c.json({
       success: true,
-      urls: urls
+      urls: urls,
+      total: total,
+      page: page,
+      pageSize: pageSize
     });
   } catch (err) {
     console.error('Error listing URLs:', err);
