@@ -6,15 +6,23 @@ const nanoid = customAlphabet('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvw
 import { z } from 'zod'
 import { zValidator } from '@hono/zod-validator'
 import { cors } from 'hono/cors'
-
+import { createAuth } from './auth'
 
 // Define the environment interface
 interface Env {
   DATABASE_URL: string
+  BETTER_AUTH_SECRET: string
+  GOOGLE_CLIENT_ID: string
+  GOOGLE_CLIENT_SECRET: string
+}
+
+type Variables = {
+  user: Record<string, unknown>
+  session: Record<string, unknown>
 }
 
 // Create the Hono app with the environment type
-const app = new Hono<{ Bindings: Env }>()
+const app = new Hono<{ Bindings: Env; Variables: Variables }>()
 
 // Add CORS middleware
 app.use('/*', cors({
@@ -34,6 +42,30 @@ app.onError((err, c) => {
     error: 'Internal server error'
   }, 500);
 });
+
+// Better Auth handler — must be before /:code catch-all
+app.on(["POST", "GET"], "/api/auth/*", (c) => {
+  const auth = createAuth(c.env, c.req.url)
+  return auth.handler(c.req.raw)
+})
+
+// Session middleware for /api/* routes (skip /api/auth/*)
+app.use('/api/*', async (c, next) => {
+  if (c.req.path.startsWith('/api/auth')) {
+    return next()
+  }
+
+  const auth = createAuth(c.env, c.req.url)
+  const session = await auth.api.getSession({ headers: c.req.raw.headers })
+
+  if (!session) {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+
+  c.set('user', session.user)
+  c.set('session', session.session)
+  return next()
+})
 
 // Helper function to fetch title from URL
 async function fetchTitle(url: string): Promise<string | null> {
@@ -155,77 +187,6 @@ app.post('/api/create', zValidator('json', urlSchema), async (c) => {
   }
 })
 
-
-
-// Redirect endpoint with analytics
-app.get('/:code', async (c) => {
-  try {
-    const code = c.req.param('code')
-    if (!code || code.includes('.') || ['favicon', 'robots', 'sitemap', 'manifest', '.well-known'].some(f => code.startsWith(f))) {
-      return c.json({ error: 'Not found' }, 404)
-    }
-    const sql = neon(c.env.DATABASE_URL)
-
-    // Fetch the URL - Explicitly use public schema
-    const results = await sql`SELECT full_url FROM public.urls WHERE short_code = ${code}`
-
-    if (!Array.isArray(results) || results.length === 0 || !results[0]?.full_url) {
-      return c.json({ success: false, error: 'Short code not found or invalid data' }, 404)
-    }
-    
-    const full_url = (results[0] as { full_url: string }).full_url
-
-    // Get country and referrer information
-    const country = c.req.header('CF-IPCountry') || 'unknown'
-    const referrerHeader = c.req.header('Referer');
-    let referrer = 'direct'; // Default if no header or empty
-    if (referrerHeader) {
-        try {
-            // Extract hostname for cleaner tracking
-            referrer = new URL(referrerHeader).hostname;
-        } catch (e) {
-            // Handle invalid URLs in referrer header, maybe log or keep as direct
-            console.warn(`Invalid Referer header URL: ${referrerHeader}`);
-            referrer = 'invalid_referrer'; // Or keep as 'direct'
-        }
-    }
-    // Update analytics in the background so the redirect is not delayed
-    c.executionCtx.waitUntil(
-      sql`UPDATE public.urls
-               SET
-                 visit_count = visit_count + 1,
-                 last_visited_at = NOW(),
-                 -- Update region visits
-                 region_visits = jsonb_set(
-                   region_visits,
-                   ARRAY[${country}::text],
-                   (COALESCE(region_visits->>${country}::text, '0')::int + 1)::text::jsonb,
-                   true
-                 ),
-                 -- Update referrer visits
-                 referrer_visits = jsonb_set(
-                   referrer_visits,
-                   ARRAY[${referrer}::text],
-                   (COALESCE(referrer_visits->>${referrer}::text, '0')::int + 1)::text::jsonb,
-                   true
-                 )
-               WHERE short_code = ${code}`
-        .then(() => console.log(`Successfully updated analytics for ${code} from ${country} / ${referrer}`))
-        .catch((updateError: unknown) => console.error(`Failed to update analytics for ${code}:`, updateError))
-    );
-
-    // Redirect to the original URL immediately
-    return c.redirect(full_url)
-
-  } catch (err) {
-    console.error('Error redirecting:', err);
-    return c.json({
-      success: false,
-      error: 'Failed to process redirect'
-    }, 500);
-  }
-})
-
 // List all URLs with visit counts
 app.get('/api/urls', async (c) => {
   try {
@@ -320,7 +281,7 @@ app.get('/api/analytics/:code', async (c) => {
     const sql = neon(c.env.DATABASE_URL)
 
     // Query the database for the specific URL record and its analytics, including title - Explicitly use public schema
-    const results = await sql`SELECT full_url, visit_count, region_visits, referrer_visits, last_visited_at, title 
+    const results = await sql`SELECT full_url, visit_count, region_visits, referrer_visits, last_visited_at, title
                              FROM public.urls
                              WHERE short_code = ${code}`
 
@@ -361,5 +322,131 @@ app.get('/api/analytics/:code', async (c) => {
   }
 });
 
+// Temporary migration endpoint — hit POST /api/migrate once to create Better Auth tables
+app.post('/api/migrate', async (c) => {
+  try {
+    const sql = neon(c.env.DATABASE_URL)
+
+    await sql`CREATE TABLE IF NOT EXISTS "user" (
+      "id" TEXT PRIMARY KEY,
+      "name" TEXT NOT NULL,
+      "email" TEXT NOT NULL UNIQUE,
+      "emailVerified" BOOLEAN NOT NULL DEFAULT FALSE,
+      "image" TEXT,
+      "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+      "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
+    )`
+
+    await sql`CREATE TABLE IF NOT EXISTS "session" (
+      "id" TEXT PRIMARY KEY,
+      "expiresAt" TIMESTAMP NOT NULL,
+      "token" TEXT NOT NULL UNIQUE,
+      "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+      "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+      "ipAddress" TEXT,
+      "userAgent" TEXT,
+      "userId" TEXT NOT NULL REFERENCES "user"("id") ON DELETE CASCADE
+    )`
+
+    await sql`CREATE TABLE IF NOT EXISTS "account" (
+      "id" TEXT PRIMARY KEY,
+      "accountId" TEXT NOT NULL,
+      "providerId" TEXT NOT NULL,
+      "userId" TEXT NOT NULL REFERENCES "user"("id") ON DELETE CASCADE,
+      "accessToken" TEXT,
+      "refreshToken" TEXT,
+      "idToken" TEXT,
+      "accessTokenExpiresAt" TIMESTAMP,
+      "refreshTokenExpiresAt" TIMESTAMP,
+      "scope" TEXT,
+      "password" TEXT,
+      "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+      "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
+    )`
+
+    await sql`CREATE TABLE IF NOT EXISTS "verification" (
+      "id" TEXT PRIMARY KEY,
+      "identifier" TEXT NOT NULL,
+      "value" TEXT NOT NULL,
+      "expiresAt" TIMESTAMP NOT NULL,
+      "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
+      "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
+    )`
+
+    return c.json({ success: true, message: 'Better Auth tables created successfully.' })
+  } catch (err) {
+    console.error('Migration error:', err)
+    return c.json({ success: false, error: String(err) }, 500)
+  }
+})
+
+// Redirect endpoint with analytics — MUST be last (catch-all)
+app.get('/:code', async (c) => {
+  try {
+    const code = c.req.param('code')
+    if (!code || code.includes('.') || ['favicon', 'robots', 'sitemap', 'manifest', '.well-known'].some(f => code.startsWith(f))) {
+      return c.json({ error: 'Not found' }, 404)
+    }
+    const sql = neon(c.env.DATABASE_URL)
+
+    // Fetch the URL - Explicitly use public schema
+    const results = await sql`SELECT full_url FROM public.urls WHERE short_code = ${code}`
+
+    if (!Array.isArray(results) || results.length === 0 || !results[0]?.full_url) {
+      return c.json({ success: false, error: 'Short code not found or invalid data' }, 404)
+    }
+
+    const full_url = (results[0] as { full_url: string }).full_url
+
+    // Get country and referrer information
+    const country = c.req.header('CF-IPCountry') || 'unknown'
+    const referrerHeader = c.req.header('Referer');
+    let referrer = 'direct'; // Default if no header or empty
+    if (referrerHeader) {
+        try {
+            // Extract hostname for cleaner tracking
+            referrer = new URL(referrerHeader).hostname;
+        } catch (e) {
+            // Handle invalid URLs in referrer header, maybe log or keep as direct
+            console.warn(`Invalid Referer header URL: ${referrerHeader}`);
+            referrer = 'invalid_referrer'; // Or keep as 'direct'
+        }
+    }
+    // Update analytics in the background so the redirect is not delayed
+    c.executionCtx.waitUntil(
+      sql`UPDATE public.urls
+               SET
+                 visit_count = visit_count + 1,
+                 last_visited_at = NOW(),
+                 -- Update region visits
+                 region_visits = jsonb_set(
+                   region_visits,
+                   ARRAY[${country}::text],
+                   (COALESCE(region_visits->>${country}::text, '0')::int + 1)::text::jsonb,
+                   true
+                 ),
+                 -- Update referrer visits
+                 referrer_visits = jsonb_set(
+                   referrer_visits,
+                   ARRAY[${referrer}::text],
+                   (COALESCE(referrer_visits->>${referrer}::text, '0')::int + 1)::text::jsonb,
+                   true
+                 )
+               WHERE short_code = ${code}`
+        .then(() => console.log(`Successfully updated analytics for ${code} from ${country} / ${referrer}`))
+        .catch((updateError: unknown) => console.error(`Failed to update analytics for ${code}:`, updateError))
+    );
+
+    // Redirect to the original URL immediately
+    return c.redirect(full_url)
+
+  } catch (err) {
+    console.error('Error redirecting:', err);
+    return c.json({
+      success: false,
+      error: 'Failed to process redirect'
+    }, 500);
+  }
+})
+
 export default app
-   

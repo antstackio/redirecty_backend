@@ -8,5 +8,9 @@
   ],
   "vars": {
     "DATABASE_URL": "postgresql://USER:PASSWORD@HOST/DATABASE?sslmode=require"
+    // Also set these as secrets via `wrangler secret put`:
+    // BETTER_AUTH_SECRET — random 32+ char string
+    // GOOGLE_CLIENT_ID — from Google Cloud Console
+    // GOOGLE_CLIENT_SECRET — from Google Cloud Console
   }
-} 
+}
