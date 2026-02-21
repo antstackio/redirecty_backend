@@ -24,9 +24,10 @@ type Variables = {
 // Create the Hono app with the environment type
 const app = new Hono<{ Bindings: Env; Variables: Variables }>()
 
-// Add CORS middleware
+// Add CORS middleware — use function-based origin for spec-compliant credentials support
+const allowedOrigins = ['http://localhost:5173', 'https://antt.me', 'https://www.antt.me', 'https://dash.antt.me']
 app.use('/*', cors({
-  origin: ['http://localhost:5173', 'https://antt.me', 'https://www.antt.me', 'https://dash.antt.me'],
+  origin: (origin) => allowedOrigins.includes(origin) ? origin : '',
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   exposeHeaders: ['Content-Length', 'X-Kuma-Revision'],
@@ -166,23 +167,9 @@ app.post('/api/create', zValidator('json', urlSchema), async (c) => {
     })
   } catch (err) {
     console.error('Error creating short URL:', err);
-    if (err instanceof Error) {
-      // Handle validation errors from zValidator
-      if (err.name === 'ZodError') {
-        return c.json({
-          success: false,
-          error: 'Invalid input data',
-          details: err.message
-        }, 400)
-      }
-      return c.json({
-        success: false,
-        error: err.message
-      }, 500)
-    }
     return c.json({
       success: false,
-      error: String(err)
+      error: err instanceof Error ? err.message : 'Internal server error'
     }, 500)
   }
 })
@@ -321,64 +308,6 @@ app.get('/api/analytics/:code', async (c) => {
     }, 500);
   }
 });
-
-// Temporary migration endpoint — hit POST /api/migrate once to create Better Auth tables
-app.post('/api/migrate', async (c) => {
-  try {
-    const sql = neon(c.env.DATABASE_URL)
-
-    await sql`CREATE TABLE IF NOT EXISTS "user" (
-      "id" TEXT PRIMARY KEY,
-      "name" TEXT NOT NULL,
-      "email" TEXT NOT NULL UNIQUE,
-      "emailVerified" BOOLEAN NOT NULL DEFAULT FALSE,
-      "image" TEXT,
-      "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
-      "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
-    )`
-
-    await sql`CREATE TABLE IF NOT EXISTS "session" (
-      "id" TEXT PRIMARY KEY,
-      "expiresAt" TIMESTAMP NOT NULL,
-      "token" TEXT NOT NULL UNIQUE,
-      "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
-      "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW(),
-      "ipAddress" TEXT,
-      "userAgent" TEXT,
-      "userId" TEXT NOT NULL REFERENCES "user"("id") ON DELETE CASCADE
-    )`
-
-    await sql`CREATE TABLE IF NOT EXISTS "account" (
-      "id" TEXT PRIMARY KEY,
-      "accountId" TEXT NOT NULL,
-      "providerId" TEXT NOT NULL,
-      "userId" TEXT NOT NULL REFERENCES "user"("id") ON DELETE CASCADE,
-      "accessToken" TEXT,
-      "refreshToken" TEXT,
-      "idToken" TEXT,
-      "accessTokenExpiresAt" TIMESTAMP,
-      "refreshTokenExpiresAt" TIMESTAMP,
-      "scope" TEXT,
-      "password" TEXT,
-      "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
-      "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
-    )`
-
-    await sql`CREATE TABLE IF NOT EXISTS "verification" (
-      "id" TEXT PRIMARY KEY,
-      "identifier" TEXT NOT NULL,
-      "value" TEXT NOT NULL,
-      "expiresAt" TIMESTAMP NOT NULL,
-      "createdAt" TIMESTAMP NOT NULL DEFAULT NOW(),
-      "updatedAt" TIMESTAMP NOT NULL DEFAULT NOW()
-    )`
-
-    return c.json({ success: true, message: 'Better Auth tables created successfully.' })
-  } catch (err) {
-    console.error('Migration error:', err)
-    return c.json({ success: false, error: String(err) }, 500)
-  }
-})
 
 // Redirect endpoint with analytics — MUST be last (catch-all)
 app.get('/:code', async (c) => {
