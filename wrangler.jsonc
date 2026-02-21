@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "redirecty",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-04",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  }
+  // DATABASE_URL is stored as a Wrangler secret (wrangler secret put DATABASE_URL)
+  // Also set these as secrets via `wrangler secret put`:
+  // BETTER_AUTH_SECRET, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+}

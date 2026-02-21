@@ -15,23 +15,11 @@ const trustedOrigins = [
   "https://dash.antt.me",
 ]
 
-// Cache pool per connection string to avoid creating a new one on every request
-let cachedPool: Pool | null = null
-let cachedConnectionString: string | null = null
-
-function getPool(connectionString: string): Pool {
-  if (cachedPool && cachedConnectionString === connectionString) {
-    return cachedPool
-  }
-  cachedPool = new Pool({ connectionString })
-  cachedConnectionString = connectionString
-  return cachedPool
-}
-
 // Runtime factory for Cloudflare Workers (env is per-request)
+// Fresh Pool per request — CF Workers prohibits sharing I/O objects across requests
 export function createAuth(env: AuthEnv, requestUrl?: string) {
   return betterAuth({
-    database: getPool(env.DATABASE_URL),
+    database: new Pool({ connectionString: env.DATABASE_URL }),
     secret: env.BETTER_AUTH_SECRET,
     baseURL: requestUrl ? new URL(requestUrl).origin : undefined,
     basePath: "/api/auth",
@@ -45,4 +33,3 @@ export function createAuth(env: AuthEnv, requestUrl?: string) {
     trustedOrigins,
   })
 }
-
