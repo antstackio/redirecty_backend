@@ -46,18 +46,3 @@ export function createAuth(env: AuthEnv, requestUrl?: string) {
   })
 }
 
-// Default export for Better Auth CLI (`npx @better-auth/cli migrate`)
-// Uses process.env fallbacks since CLI doesn't have Cloudflare env bindings
-export const auth = betterAuth({
-  database: new Pool({ connectionString: process.env.DATABASE_URL || "" }),
-  secret: process.env.BETTER_AUTH_SECRET || "cli-only",
-  basePath: "/api/auth",
-  socialProviders: {
-    google: {
-      clientId: process.env.GOOGLE_CLIENT_ID || "cli-only",
-      clientSecret: process.env.GOOGLE_CLIENT_SECRET || "cli-only",
-      prompt: "select_account" as const,
-    },
-  },
-  trustedOrigins,
-})
