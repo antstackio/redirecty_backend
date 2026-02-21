@@ -2,12 +2,7 @@
   "name": "redirecty",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy --minify",
-    "test": "node test.js",
-    "query-analytics": "node test.js query-analytics",
-    "list-datasets": "node test.js list-datasets",
-    "list-urls": "node test.js list-urls",
-    "test-analytics": "node test.js test-analytics"
+    "deploy": "wrangler deploy --minify"
   },
   "dependencies": {
     "@hono/zod-validator": "^0.1.11",
